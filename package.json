@@ -1,0 +1,24 @@
+{
+  "name": "foqus-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev --config crates/foqus-app/tauri.conf.json",
+    "desktop:build": "tauri build --config crates/foqus-app/tauri.conf.json --no-bundle",
+    "check:ui": "node scripts/ui-smoke.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "playwright": "^1.65.0",
+    "prettier": "^3.9.10",
+    "typescript": "^5",
+    "vite": "^7"
+  }
+}

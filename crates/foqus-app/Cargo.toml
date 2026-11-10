@@ -1,0 +1,20 @@
+[package]
+name = "foqus-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foqus-core = { path = "../foqus-core" }
+foqus-windows = { path = "../foqus-windows" }
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rfd.workspace = true
+png = "0.18"
+base64 = "0.22"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
