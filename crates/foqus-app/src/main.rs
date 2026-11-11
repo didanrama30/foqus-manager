@@ -5,6 +5,7 @@ use base64::Engine;
 mod client;
 
 use client::ControllerClient;
+#[cfg(not(windows))]
 use foqus_core::ProcessControlBackend;
 use foqus_core::controller::FocusController;
 use foqus_core::{
