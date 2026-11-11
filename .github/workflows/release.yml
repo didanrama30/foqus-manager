@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v1.0.0"
+      - "v1.0.1"
   workflow_dispatch:
 
 permissions:
@@ -99,7 +99,7 @@ jobs:
           name: foqus-manager-windows-x64
           path: dist-release
 
-      - name: Create release v1.0.0
+      - name: Create release v1.0.1
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

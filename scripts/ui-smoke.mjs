@@ -163,6 +163,10 @@ try {
   await page.waitForFunction(
     () => window.__saved?.profiles[0].managed_executables.length === 1,
   );
+  assert.match(
+    await page.locator("#process-body").innerText(),
+    /Saved · Manage/,
+  );
   await page
     .locator('#process-body tr')
     .first()
@@ -171,6 +175,7 @@ try {
   await page.waitForFunction(
     () => window.__saved?.profiles[0].managed_executables.length === 0,
   );
+  assert.match(await page.locator("#process-body").innerText(), /Not applied/);
   await mkdir("artifacts", { recursive: true });
   for (const width of [1000, 1280]) {
     await page.setViewportSize({ width, height: 760 });
@@ -193,6 +198,10 @@ try {
     }
   }
   if (!native) {
+    assert.match(
+      await page.locator("#apply-state").innerText(),
+      /next time Focus Mode starts/,
+    );
     await page.locator("#memory-setting").check();
     await page.waitForFunction(
       () => window.__saved?.profiles[0].reduce_background_memory === true,

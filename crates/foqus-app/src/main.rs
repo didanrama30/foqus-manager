@@ -3,19 +3,20 @@
 #[cfg(windows)]
 use base64::Engine;
 mod client;
+mod desktop;
 
 use client::ControllerClient;
 #[cfg(not(windows))]
 use foqus_core::ProcessControlBackend;
 use foqus_core::controller::FocusController;
 use foqus_core::{
-    GameProfile, ProcessCapability, ProcessIdentity, ProcessSample, ProcessState, ProfileStore,
-    SessionStatus, default_journal_path, default_profile_path, normalize_executable,
+    FocusState, GameProfile, ProcessCapability, ProcessIdentity, ProcessSample, ProcessState,
+    ProfileStore, SessionStatus, default_journal_path, default_profile_path, normalize_executable,
     protocol::serve,
 };
 use foqus_windows::PlatformBackend;
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -64,6 +65,7 @@ struct Snapshot {
     memory: Option<(u64, u64)>,
     cpu: Option<f32>,
     demo: bool,
+    monitoring_error: Option<String>,
 }
 
 struct AppState {
@@ -90,7 +92,7 @@ fn load_profiles(state: tauri::State<'_, AppState>) -> Result<ProfileStore, Stri
 #[tauri::command]
 fn save_profiles(store: ProfileStore, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let _lock = state.profile_lock.lock().map_err(|e| e.to_string())?;
-    ProfileStore::load(&default_profile_path()).map_err(|e| e.to_string())?;
+    let existing = ProfileStore::load(&default_profile_path()).map_err(|e| e.to_string())?;
     if store.schema_version != foqus_core::PROFILE_SCHEMA_VERSION
         || store
             .profiles
@@ -101,9 +103,66 @@ fn save_profiles(store: ProfileStore, state: tauri::State<'_, AppState>) -> Resu
             "Profiles require a name, absolute executable path, and supported schema".into(),
         );
     }
+    let removes_profiles = existing
+        .profiles
+        .iter()
+        .any(|old| !store.profiles.iter().any(|new| new.id == old.id));
+    let active_profile = if removes_profiles {
+        read_active_profile_id(&state)
+    } else {
+        Ok(None)
+    };
+    verify_profile_removal(&existing, &store, active_profile)?;
     store
         .save_atomic(&default_profile_path())
         .map_err(|e| e.to_string())
+}
+
+fn read_active_profile_id(state: &AppState) -> Result<Option<String>, String> {
+    let mut guard = state
+        .controller
+        .lock()
+        .map_err(|_| "focus controller lock poisoned".to_string())?;
+    let controller = guard.as_mut().ok_or("focus controller is not ready")?;
+    let status = controller.status()?;
+    if matches!(status.state, FocusState::Idle) {
+        return Ok(None);
+    }
+    status
+        .profile_id
+        .map(Some)
+        .ok_or_else(|| "the active Focus Mode profile could not be determined".to_string())
+}
+
+/// Removing profiles is allowed only when the controller state is known and
+/// the removed profile is not the one the active session owns. If the status
+/// cannot be read, fail closed instead of risking deletion of an active game.
+fn verify_profile_removal(
+    existing: &ProfileStore,
+    updated: &ProfileStore,
+    active_profile: Result<Option<String>, String>,
+) -> Result<(), String> {
+    let removed: Vec<&str> = existing
+        .profiles
+        .iter()
+        .filter(|old| !updated.profiles.iter().any(|new| new.id == old.id))
+        .map(|profile| profile.id.as_str())
+        .collect();
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let active_profile = active_profile.map_err(|error| {
+        format!("Cannot verify the active Focus Mode profile; refusing to remove profiles. {error}")
+    })?;
+    if let Some(active_profile) = active_profile
+        && removed.contains(&active_profile.as_str())
+    {
+        return Err(
+            "The active Focus Mode profile cannot be removed while Focus Mode is running. Stop Focus Mode first."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -122,22 +181,29 @@ fn start_focus(
 ) -> Result<SessionStatus, String> {
     let identity =
         ProcessIdentity::from_ui(pid, &creation_time_100ns).map_err(|e| e.to_string())?;
-    let path_matches = state
-        .snapshot
-        .lock()
-        .map_err(|e| e.to_string())?
-        .processes
-        .iter()
-        .find(|process| {
-            process.identity.pid == pid
-                && process.identity.creation_time_100ns == creation_time_100ns
-        })
-        .and_then(|process| process.executable_path.as_ref())
-        .is_some_and(|path| {
-            normalize_executable(path) == normalize_executable(&profile.executable_path)
-        });
-    if !path_matches {
-        return Err("the selected game no longer matches this profile".into());
+    {
+        let snapshot = state.snapshot.lock().map_err(|e| e.to_string())?;
+        let process = snapshot
+            .processes
+            .iter()
+            .find(|process| {
+                process.identity.pid == pid
+                    && process.identity.creation_time_100ns == creation_time_100ns
+            })
+            .ok_or("the selected game is no longer running")?;
+        if process.state != ProcessState::Running {
+            return Err("the selected game cannot be queried".into());
+        }
+        if process.capability != ProcessCapability::Candidate {
+            return Err("the selected process is protected and cannot be focused".into());
+        }
+        let path = process
+            .executable_path
+            .as_ref()
+            .ok_or("the selected game has no executable path")?;
+        if normalize_executable(path) != normalize_executable(&profile.executable_path) {
+            return Err("the selected game no longer matches this profile".into());
+        }
     }
     let mut guard = state.controller.lock().map_err(|e| e.to_string())?;
     let controller = guard.as_mut().ok_or("focus controller is not ready")?;
@@ -166,6 +232,48 @@ fn apply_profile(
     let mut guard = state.controller.lock().map_err(|e| e.to_string())?;
     let controller = guard.as_mut().ok_or("focus controller is not ready")?;
     controller.apply_profile(profile)
+}
+
+fn shutdown_controller(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match state.controller.try_lock() {
+            Ok(mut guard) => {
+                if let Some(mut controller) = guard.take() {
+                    controller.shutdown();
+                }
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    // A command is still using the controller. Exiting closes
+                    // its stdin, which makes the controller restore and exit;
+                    // an unfinished restore stays in the journal for the next
+                    // startup.
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Explicit Exit: stop the controller (restoring what Foqus changed and
+/// preserving the journal if restore cannot finish), then quit.
+pub(crate) fn exit_application(app: &tauri::AppHandle) {
+    shutdown_controller(app);
+    app.exit(0);
+}
+
+#[tauri::command]
+fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
+    exit_application(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -292,13 +400,14 @@ fn main() {
             let mut backend = foqus_windows::WindowsBackend::default();
             loop {
                 let started = std::time::Instant::now();
-                let (processes, memory, cpu) = backend.sample();
+                let sample = backend.sample();
                 if let Ok(mut value) = shared.lock() {
                     *value = Snapshot {
-                        processes: processes.into_iter().map(UiProcess::from).collect(),
-                        memory,
-                        cpu,
+                        processes: sample.processes.into_iter().map(UiProcess::from).collect(),
+                        memory: sample.memory,
+                        cpu: sample.cpu,
                         demo: false,
+                        monitoring_error: sample.error,
                     };
                 }
                 std::thread::sleep(Duration::from_secs(1).saturating_sub(started.elapsed()));
@@ -331,19 +440,21 @@ fn main() {
     };
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            use tauri::Manager;
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
-            }
+            desktop::show_main(app);
         }))
         .manage(app_state)
         .setup(|app| {
             use tauri::Manager;
-            let state = app.state::<AppState>();
-            *state
-                .controller
-                .lock()
-                .map_err(|_| "controller lock poisoned")? = Some(ControllerClient::spawn());
+            {
+                let state = app.state::<AppState>();
+                *state
+                    .controller
+                    .lock()
+                    .map_err(|_| "controller lock poisoned")? = Some(ControllerClient::spawn());
+            }
+            if let Err(error) = desktop::install(app) {
+                tracing::warn!("notification-area tray unavailable: {error}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -356,19 +467,70 @@ fn main() {
             start_focus,
             stop_focus,
             retry_restore,
-            apply_profile
+            apply_profile,
+            exit_app
         ])
         .build(tauri::generate_context!())
         .expect("could not build Foqus Manager");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            use tauri::Manager;
-            if let Some(state) = app_handle.try_state::<AppState>()
-                && let Ok(mut controller) = state.controller.lock()
-                && let Some(controller) = controller.as_mut()
-            {
-                controller.shutdown();
-            }
+            shutdown_controller(app_handle);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_profile_removal;
+    use foqus_core::{GameProfile, ProfileStore};
+    use std::path::PathBuf;
+
+    fn profile(id: &str) -> GameProfile {
+        GameProfile {
+            id: id.into(),
+            name: id.into(),
+            executable_path: PathBuf::from(r"C:\Games\game.exe"),
+            game_priority: Default::default(),
+            reduce_background_memory: false,
+            managed_executables: vec![],
+            excluded_executables: vec![],
+            restore_when_game_exits: true,
+        }
+    }
+
+    fn store(ids: &[&str]) -> ProfileStore {
+        ProfileStore {
+            schema_version: foqus_core::PROFILE_SCHEMA_VERSION,
+            selected_profile: ids.first().map(|id| (*id).to_string()),
+            profiles: ids.iter().map(|id| profile(id)).collect(),
+        }
+    }
+
+    #[test]
+    fn removal_fails_closed_when_active_profile_cannot_be_read() {
+        let existing = store(&["game-a", "game-b"]);
+        let updated = store(&["game-a"]);
+        let result = verify_profile_removal(
+            &existing,
+            &updated,
+            Err("focus controller is not ready".into()),
+        );
+        assert!(result.unwrap_err().contains("refusing to remove profiles"));
+    }
+
+    #[test]
+    fn removal_rejects_the_active_profile_only() {
+        let existing = store(&["game-a", "game-b"]);
+        let updated = store(&["game-a"]);
+        assert!(verify_profile_removal(&existing, &updated, Ok(Some("game-b".into()))).is_err());
+        assert!(verify_profile_removal(&existing, &updated, Ok(Some("game-a".into()))).is_ok());
+        assert!(verify_profile_removal(&existing, &updated, Ok(None)).is_ok());
+    }
+
+    #[test]
+    fn unknown_status_does_not_block_saves_without_removals() {
+        let existing = store(&["game-a"]);
+        let updated = store(&["game-a"]);
+        assert!(verify_profile_removal(&existing, &updated, Err("unavailable".into())).is_ok());
+    }
 }

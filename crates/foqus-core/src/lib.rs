@@ -176,6 +176,12 @@ pub enum ControlError {
 
 pub trait ProcessControlBackend: Send + Sync {
     fn list_processes(&self) -> Vec<ProcessSample>;
+    /// Backend-side eligibility check for a focus target. The UI checks are not
+    /// trusted on their own: every start is re-validated against the live
+    /// process (owner, session, protected paths and names).
+    fn validate_target(&self, _identity: ProcessIdentity) -> Result<(), ControlError> {
+        Ok(())
+    }
     fn read_priorities(&self, identity: ProcessIdentity)
     -> Result<ProcessPriorities, ControlError>;
     fn set_cpu_priority(
@@ -195,10 +201,19 @@ pub trait ProcessControlBackend: Send + Sync {
 pub enum FocusState {
     Idle,
     Starting,
-    Active { started_at_unix: u64 },
+    Active {
+        started_at_unix: u64,
+        /// True when the game exited while `restore_when_game_exits` was off.
+        /// The session deliberately stays active so the user can stop it and
+        /// restore the changes manually.
+        #[serde(default)]
+        target_exited: bool,
+    },
     Stopping,
     Recovery,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -215,9 +230,12 @@ pub struct FocusSession {
 pub struct SessionStatus {
     pub state: FocusState,
     pub target: Option<ProcessIdentity>,
+    pub profile_id: Option<String>,
     pub profile_name: Option<String>,
     pub outcomes: Vec<ProcessOutcome>,
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub last_action_errors: Vec<String>,
     pub applied_changes: usize,
 }
 
@@ -226,9 +244,11 @@ impl Default for SessionStatus {
         Self {
             state: FocusState::Idle,
             target: None,
+            profile_id: None,
             profile_name: None,
             outcomes: vec![],
             errors: vec![],
+            last_action_errors: vec![],
             applied_changes: 0,
         }
     }
@@ -355,8 +375,77 @@ pub fn default_journal_path() -> PathBuf {
     base.join("FoqusManager").join("focus-journal.json")
 }
 
+/// Case-insensitive, component-aware containment test for Windows paths.
+///
+/// A raw string-prefix check treats `C:\WindowsApps\game.exe` as living under
+/// `C:\Windows`. This compares whole path components instead, so only real
+/// descendants match. Both `/` and `\` separators are accepted, and the
+/// extended-length prefix (`\\?\`) is ignored for the comparison.
+pub fn is_path_within(path: &str, root: &str) -> bool {
+    fn components(value: &str) -> (Option<String>, Vec<String>) {
+        let mut value = value.trim().trim_matches('"').replace('/', "\\");
+        if let Some(stripped) = value.strip_prefix(r"\\?\") {
+            value = stripped.to_owned();
+        }
+        let mut drive = None;
+        let mut rest = value.as_str();
+        if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
+            drive = Some(rest[..2].to_ascii_lowercase());
+            rest = &rest[2..];
+        }
+        let mut parts = Vec::new();
+        for part in rest.split('\\') {
+            match part.trim() {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                component => parts.push(component.to_ascii_lowercase()),
+            }
+        }
+        (drive, parts)
+    }
+
+    let (path_drive, path_parts) = components(path);
+    let (root_drive, root_parts) = components(root);
+    if path_drive != root_drive || path_parts.len() < root_parts.len() {
+        return false;
+    }
+    path_parts[..root_parts.len()] == root_parts[..]
+}
+
 pub fn unix_seconds(time: SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_path_within;
+
+    #[test]
+    fn containment_uses_path_components_not_string_prefixes() {
+        assert!(is_path_within(
+            r"C:\Windows\System32\svchost.exe",
+            r"C:\Windows"
+        ));
+        assert!(!is_path_within(r"C:\WindowsApps\game.exe", r"C:\Windows"));
+        assert!(!is_path_within(
+            r"C:\Windows\game.exe",
+            r"C:\Windows\System32"
+        ));
+        assert!(is_path_within(r"C:\Windows", r"C:\Windows"));
+        assert!(is_path_within(r"C:/Windows/System32/a.exe", r"c:\windows\"));
+        assert!(!is_path_within(r"D:\Windows\x.exe", r"C:\Windows"));
+        assert!(is_path_within(r"\\?\C:\Windows\x.exe", r"C:\Windows"));
+        assert!(is_path_within(
+            r"\\server\share\Windows\x.exe",
+            r"\\server\share\Windows"
+        ));
+        assert!(!is_path_within(
+            r"\\server\share\WindowsApps\x.exe",
+            r"\\server\share\Windows"
+        ));
+    }
 }

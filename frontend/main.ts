@@ -16,6 +16,7 @@ interface Process {
 interface FocusState {
   kind: "idle" | "starting" | "active" | "stopping" | "recovery" | "error";
   started_at_unix?: number;
+  target_exited?: boolean;
   message?: string;
 }
 interface ProcessOutcome {
@@ -28,9 +29,11 @@ interface ProcessOutcome {
 interface FocusStatus {
   state: FocusState;
   target: { pid: number; creation_time_100ns: string } | null;
+  profile_id?: string | null;
   profile_name: string | null;
   outcomes: ProcessOutcome[];
   errors: string[];
+  last_action_errors?: string[];
   applied_changes: number;
 }
 interface Snapshot {
@@ -38,6 +41,7 @@ interface Snapshot {
   memory: [number, number] | null;
   cpu: number | null;
   demo: boolean;
+  monitoring_error?: string | null;
 }
 interface Profile {
   id: string;
@@ -61,6 +65,7 @@ let snapshot: Snapshot = {
   memory: null,
   cpu: null,
   demo: !native,
+  monitoring_error: null,
 };
 let store: Store = { schema_version: 1, selected_profile: null, profiles: [] };
 let canSave = false,
@@ -72,10 +77,12 @@ let canSave = false,
 let target = "",
   refreshing = false,
   controllerErrorShown = false,
+  controllerError = "",
   errorTimer: ReturnType<typeof setTimeout>;
 let focus: FocusStatus = {
   state: { kind: "idle" },
   target: null,
+  profile_id: null,
   profile_name: null,
   outcomes: [],
   errors: [],
@@ -153,9 +160,9 @@ $("#app")!.innerHTML =
         "</span></button>",
     )
     .join("") +
-  '</nav><div class="sidebar-bottom"><small>Foqus Manager · v1.0.0</small><button class="github" disabled title="Repository link will be available soon" aria-label="GitHub repository link unavailable"><img src="' +
+  '</nav><div class="sidebar-bottom"><small>Foqus Manager · v1.0.1</small><button class="github" disabled title="Repository link will be available soon" aria-label="GitHub repository link unavailable"><img src="' +
   github +
-  '" alt=""></button></div></aside><div class="workspace"><main class="page" id="page"></main><footer class="footer"><span><i class="dot"></i>Focus Mode idle</span><span id="sample-state">Connecting to monitoring…</span></footer></div></div><div id="toast" class="toast" role="alert" hidden></div><dialog id="dialog" class="modal"></dialog>';
+  '" alt=""></button></div></aside><div class="workspace"><main class="page" id="page"></main><footer class="footer"><span><i class="dot"></i><span id="focus-footer">Focus Mode idle</span></span><span id="sample-state">Connecting to monitoring…</span></footer></div></div><div id="toast" class="toast" role="alert" hidden></div><dialog id="dialog" class="modal"></dialog>';
 
 function chart(values: (number | null)[], color: string) {
   const points = values.map((v, i) =>
@@ -201,19 +208,19 @@ function overview() {
       "Overview",
       "Keep your game in focus. Keep background activity under control.",
     ) +
+    '<div id="monitoring-error" class="notice" hidden></div>' +
     '<section class="card focus-card"><div class="focus-main"><div><span class="eyebrow">FOCUSED APPLICATION</span><h2 id="target-name">Choose a running game</h2><small id="target-meta">Select one game instance to prepare its profile.</small><div><select id="target-picker" aria-label="Choose running game"></select></div></div><div class="focus-actions"><button class="primary" id="focus-toggle" data-action="focus-toggle" disabled>Start Focus Mode</button><small id="focus-toggle-note">Process control unavailable</small></div></div><div class="focus-bottom"><span id="focus-state">Focus Mode idle</span><span id="focus-managed">0 apps managed</span><span id="target-policy">No active policy</span></div><div id="focus-error" class="notice" hidden></div></section>' +
     '<div class="overview-grid"><section class="card"><h2>CPU</h2><div class="metric" id="cpu-value">—</div><small>Total system utilization</small><div id="cpu-chart"></div></section><section class="card"><h2>Memory</h2><div class="metric" id="memory-value">—</div><small id="memory-total">System memory in use</small><div id="memory-chart"></div></section><section class="card"><div class="card-title"><h2>Resource breakdown</h2><small>Top CPU consumers</small></div><div id="breakdown"></div><small>Memory values are per-process working sets.</small></section><section class="card"><h2>Your focus policy</h2><div class="policy-row"><span class="muted">Background CPU cap</span><span>Unavailable</span></div><div class="policy-row"><span class="muted">Game priority</span><span>Above normal</span></div><div class="policy-row"><span class="muted">Memory priority</span><span id="policy-memory">No profile selected</span></div><div class="policy-row"><span class="muted">Restore when game exits</span><span id="policy-restore">On</span></div><button class="wide" data-action="edit-target">Edit game profile</button></section></div>'
   );
-}
-function focusActive() {
-  return ["starting", "active", "stopping", "recovery"].includes(focus.state.kind);
 }
 function focusLabel() {
   switch (focus.state.kind) {
     case "starting":
       return "Starting Focus Mode…";
     case "active":
-      return "Focus Mode active";
+      return focus.state.target_exited
+        ? "Game exited · priorities held"
+        : "Focus Mode active";
     case "stopping":
       return "Stopping and restoring…";
     case "recovery":
@@ -223,6 +230,18 @@ function focusLabel() {
     default:
       return "Focus Mode idle";
   }
+}
+function focusActive() {
+  return ["starting", "active", "stopping", "recovery"].includes(focus.state.kind);
+}
+function focusNeedsRecovery() {
+  return focus.state.kind === "error" || focus.state.kind === "recovery";
+}
+function recoveryBlocked() {
+  return (
+    focus.state.kind === "error" &&
+    (focus.state.message ?? "").toLowerCase().includes("recover")
+  );
 }
 function outcomeFor(process: Process) {
   if (focus.state.kind === "idle") return undefined;
@@ -250,7 +269,7 @@ function syncFocusControls() {
   const toggle = $<HTMLButtonElement>("#focus-toggle");
   if (!toggle) return;
   const active = focusActive();
-  const error = focus.state.kind === "error" || focus.state.kind === "recovery";
+  const error = focusNeedsRecovery();
   const game = snapshot.processes.find((p) => key(p) === target);
   const profile = game
     ? store.profiles.find(
@@ -277,16 +296,36 @@ function syncFocusControls() {
   note.textContent = snapshot.demo
     ? "Process control requires Windows"
     : error
-      ? focus.state.kind === "error" && focus.state.message
-        ? focus.state.message
-        : "A previous session still needs recovery"
-      : active
-        ? `${focus.applied_changes} process${focus.applied_changes === 1 ? "" : "es"} changed`
-        : "Priorities only; CPU hard cap unavailable";
+      ? recoveryBlocked()
+        ? `${focus.state.message} The existing journal was left untouched so original priorities are not lost. Retry restore or Exit Foqus Manager.`
+        : focus.state.kind === "error" && focus.state.message
+          ? focus.state.message
+          : "A previous session still needs recovery"
+      : focus.state.kind === "active" && focus.state.target_exited
+        ? `${focus.applied_changes} change${focus.applied_changes === 1 ? "" : "s"} stay applied until you stop Focus Mode`
+        : active
+          ? `${focus.applied_changes} process${focus.applied_changes === 1 ? "" : "es"} changed`
+          : "Saved settings apply when Focus Mode starts";
   $("#focus-state")!.textContent = focusLabel();
   $("#focus-managed")!.textContent = `${focus.applied_changes} apps managed`;
-  $("#focus-error")!.hidden = !focus.errors.length;
-  $("#focus-error")!.textContent = focus.errors.join(" · ");
+  const messages = controllerError ? [controllerError, ...focus.errors] : [...focus.errors];
+  const box = $("#focus-error")!;
+  box.hidden = !messages.length;
+  box.innerHTML = messages.length ? esc(messages.join(" · ")) : "";
+  if (messages.length && recoveryBlocked()) {
+    const hint = document.createElement("small");
+    hint.textContent =
+      "The journal was preserved; Foqus will not start a new session and overwrite it.";
+    box.appendChild(hint);
+  }
+  if (messages.length && error) {
+    const exit = document.createElement("button");
+    exit.textContent = "Exit Foqus Manager";
+    exit.className = "quiet danger";
+    exit.dataset.action = "exit-app";
+    box.appendChild(exit);
+  }
+  $("#focus-footer")!.textContent = focusLabel();
 }
 
 function updateOverview() {
@@ -313,6 +352,11 @@ function updateOverview() {
   }
   const game = snapshot.processes.find((p) => key(p) === target);
   if (target && !game) target = "";
+  const monitor = $("#monitoring-error")!;
+  monitor.hidden = !snapshot.monitoring_error;
+  monitor.textContent = snapshot.monitoring_error
+    ? "Process monitoring unavailable: " + snapshot.monitoring_error
+    : "";
   $("#target-name")!.textContent = game
     ? title(game.name)
     : focusActive()
@@ -323,18 +367,35 @@ function updateOverview() {
     : focusActive()
       ? `Managed by Focus Mode · ${focus.applied_changes} process change${focus.applied_changes === 1 ? "" : "s"}`
       : "Select one game instance to prepare its profile.";
-  const profile = store.profiles.find(
+  const gameProfile = store.profiles.find(
     (p) =>
       p.executable_path.toLowerCase() === game?.executable_path?.toLowerCase(),
   );
-  $("#target-policy")!.textContent = profile
-    ? "Profile: " + profile.name
-    : "No active policy";
-  $("#policy-memory")!.textContent = profile?.reduce_background_memory
-    ? "Reduced"
-    : "Default";
-  $("#policy-restore")!.textContent =
-    profile?.restore_when_game_exits === false ? "Off" : "On";
+  const profile =
+    gameProfile ??
+    (focusActive()
+      ? store.profiles.find((p) => p.id === focus.profile_id)
+      : undefined);
+  const applied =
+    focusActive() &&
+    focus.state.kind !== "recovery" &&
+    !!profile &&
+    focus.profile_id === profile.id;
+  $("#target-policy")!.textContent = applied
+    ? "Applied: " + profile.name
+    : profile
+      ? "Saved profile: " + profile.name
+      : "No active policy";
+  $("#policy-memory")!.textContent = profile
+    ? profile.reduce_background_memory
+      ? "Reduced (saved)"
+      : "Default (saved)"
+    : "No profile selected";
+  $("#policy-restore")!.textContent = profile
+    ? profile.restore_when_game_exits
+      ? "On (saved)"
+      : "Off (saved)"
+    : "On";
   $("#cpu-value")!.textContent = pct(snapshot.cpu);
   $("#memory-value")!.textContent = fmt(snapshot.memory?.[0] ?? null);
   $("#memory-total")!.textContent = snapshot.memory
@@ -371,7 +432,7 @@ function processes() {
     ) +
     '<div class="toolbar"><input type="search" id="search" placeholder="Search by name or process ID" aria-label="Search processes" value="' +
     esc(query) +
-    '"><select id="process-filter" aria-label="Process status filter"><option value="all">All processes</option><option value="candidate">Candidates</option><option value="protected">System protected</option></select><small id="process-count"></small><button class="right" data-action="exceptions">Manage exclusions</button></div><div class="summary"><span class="chip" id="chip-focused">0 focused</span><span class="chip cyan" id="chip-managed">0 managed</span><span class="chip gray" id="chip-excluded">0 excluded</span><small id="resource-summary"></small></div><section class="card table-card"><div class="table-scroll"><table><thead><tr><th>Name</th><th><button class="sort-button" data-sort="cpu">CPU ↓</button></th><th><button class="sort-button" data-sort="memory">Working set</button></th><th>Focus policy</th><th>Status</th></tr></thead><tbody id="process-body"></tbody></table></div></section><aside class="card callout"><p>CPU limiting is not available in this version.</p><small>Priority changes apply to the selected game and managed background apps. Excluding a process restores Foqus changes immediately.</small></aside>'
+    '"><select id="process-filter" aria-label="Process status filter"><option value="all">All processes</option><option value="candidate">Candidates</option><option value="protected">System protected</option></select><small id="process-count"></small><button class="right" data-action="exceptions">Manage exclusions</button></div><div class="summary"><span class="chip" id="chip-focused">0 focused</span><span class="chip cyan" id="chip-managed">0 managed</span><span class="chip gray" id="chip-excluded">0 excluded</span><small id="resource-summary"></small></div><section class="card table-card"><div class="table-scroll"><table><thead><tr><th>Name</th><th><button class="sort-button" data-sort="cpu">CPU ↓</button></th><th><button class="sort-button" data-sort="memory">Working set</button></th><th>Focus policy</th><th>Status</th></tr></thead><tbody id="process-body"></tbody></table></div></section><aside class="card callout"><p>Saved policy and applied state are shown separately.</p><small>Priority changes are applied only while Focus Mode runs. Managed apps get below-normal CPU priority and optional low memory priority; excluded apps are never changed. Removing a managed app or excluding it restores Foqus changes immediately.</small></aside>'
   );
 }
 function processRows() {
@@ -448,12 +509,18 @@ function updateProcesses() {
                                 ? "Restore failed"
                                 : outcome.outcome === "Exited"
                                   ? "Exited"
-                                  : outcome.outcome
+                                  : outcome.outcome === "Skipped"
+                                    ? isTarget
+                                      ? outcome.message?.includes("already above normal")
+                                        ? "Already compliant"
+                                        : "Left unchanged"
+                                      : "Skipped"
+                                    : outcome.outcome
                   : policy === "managed"
-                    ? "Managed"
+                    ? "Saved · Manage"
                     : policy === "excluded"
-                      ? "Excluded"
-                      : "Candidate";
+                      ? "Saved · Exclude"
+                      : "Not applied";
           const badge =
             p.state === "AccessDenied"
               ? "protected"
@@ -461,7 +528,7 @@ function updateProcesses() {
                 ? "protected"
                 : partial
                   ? "gray"
-                  : outcome?.outcome === "Applied" || policy === "managed"
+                  : outcome?.outcome === "Applied"
                     ? "saved"
                     : policy === "excluded"
                       ? "gray"
@@ -502,10 +569,10 @@ function updateProcesses() {
             fmt(p.working_set_bytes) +
             '</td><td class="muted">' +
             (policy === "managed"
-              ? "Managed"
+              ? "Managed (saved)"
               : policy === "excluded"
-                ? "Excluded"
-                : "Not active") +
+                ? "Excluded (saved)"
+                : "Not set") +
             actions +
             '</td><td><span class="badge ' +
             badge +
@@ -523,9 +590,9 @@ function updateProcesses() {
   const profile = selected();
   $("#chip-focused")!.textContent = focusActive() ? "1 focused" : "0 focused";
   $("#chip-managed")!.textContent =
-    (profile?.managed_executables.length ?? 0) + " managed";
+    (profile?.managed_executables.length ?? 0) + " saved managed";
   $("#chip-excluded")!.textContent =
-    (profile?.excluded_executables.length ?? 0) + " excluded";
+    (profile?.excluded_executables.length ?? 0) + " saved excluded";
   document.querySelectorAll<HTMLElement>("[data-sort]").forEach((b) => {
     b.textContent =
       (b.dataset.sort === "cpu" ? "CPU" : "Working set") +
@@ -557,11 +624,15 @@ function profiles() {
         esc(p.name) +
         '"><small class="path">' +
         esc(p.executable_path) +
+        '</small><small class="path" id="apply-state">' +
+        applyStateText(p) +
         '</small></div><span id="save-status" class="badge ' +
-        (saveStatus === "Saved" ? "saved" : "protected") +
+        (saveStatus === "Saved" || saveStatus === "Saved · applied"
+          ? "saved"
+          : "protected") +
         '">' +
         esc(saveStatus) +
-        '</span></div><div class="settings-section"><h2>CPU allocation</h2><div class="setting-row"><div class="description">Game priority<small>Give the game preference when CPU is busy.</small></div><select aria-label="Game priority"><option>Above normal</option></select></div><div class="setting-row"><div class="description">Background CPU limit<small>Combined limit for managed background apps.</small></div><button disabled title="CPU limiting is not available in this version">Unavailable</button></div><input class="range" type="range" disabled value="0" aria-label="CPU limiting unavailable"><small>CPU limiting is not available in this version.</small></div><div class="settings-section"><h2>Memory</h2><label class="setting-row"><div class="description">Reduce background memory priority<small>Helps Windows reclaim memory when needed; does not reserve RAM.</small></div><input type="checkbox" class="toggle" id="memory-setting" ' +
+        '</span></div><div class="settings-section"><h2>CPU allocation</h2><div class="setting-row"><div class="description">Game priority<small>Give the game preference when CPU is busy. A game already at a higher priority is never lowered.</small></div><select aria-label="Game priority"><option>Above normal</option></select></div><div class="setting-row"><div class="description">Background CPU limit<small>Combined limit for managed background apps.</small></div><button disabled title="CPU limiting is not available in this version">Unavailable</button></div><input class="range" type="range" disabled value="0" aria-label="CPU limiting unavailable"><small>CPU limiting is not available in this version.</small></div><div class="settings-section"><h2>Memory</h2><label class="setting-row"><div class="description">Reduce background memory priority<small>Helps Windows reclaim memory when needed; does not reserve RAM.</small></div><input type="checkbox" class="toggle" id="memory-setting" ' +
         (p.reduce_background_memory ? "checked" : "") +
         '></label></div><div class="settings-section"><div class="card-title"><h2>Exclusions</h2><button data-action="exceptions">Edit exclusions</button></div><div class="exceptions"><span class="exception-tag">Audio services</span><span class="exception-tag">Anti-cheat</span><span class="exception-tag">System</span>' +
         p.excluded_executables
@@ -584,12 +655,22 @@ function profiles() {
               "</span>",
           )
           .join("") +
-        '</div><small>Managed apps use below-normal CPU priority and optional low memory priority. Excluded apps are never changed and are restored immediately.</small></div><div class="settings-section"><label class="setting-row"><div class="description">Restore settings when the game exits<small>Return priorities to their previous values.</small></div><input class="toggle" type="checkbox" id="restore-setting" ' +
+        '</div><small>Managed apps use below-normal CPU priority and optional low memory priority. Excluded apps are never changed and are restored immediately.</small></div><div class="settings-section"><label class="setting-row"><div class="description">Restore settings when the game exits<small>When on, priorities return to their previous values. When off, Focus Mode stays active with the changes applied until you stop it.</small></div><input class="toggle" type="checkbox" id="restore-setting" ' +
         (p.restore_when_game_exits ? "checked" : "") +
         '></label></div><div class="settings-section"><button class="quiet danger" data-action="remove-profile">Remove profile</button></div></section>'
       : '<section class="card empty"><h2>Choose a game profile</h2><p>Add a game executable or select a running process to configure its settings.</p><button class="primary" data-action="add-profile">+ Add game</button></section>') +
     "</div>"
   );
+}
+
+function applyStateText(profile: Profile) {
+  const applied =
+    focusActive() &&
+    focus.state.kind !== "recovery" &&
+    focus.profile_id === profile.id;
+  return applied
+    ? "Saved settings are applied to the active Focus Mode session."
+    : "Saved settings apply the next time Focus Mode starts.";
 }
 
 function save(): Promise<void> {
@@ -629,11 +710,23 @@ function save(): Promise<void> {
 }
 async function applyProfileToController(profile: Profile) {
   if (!native) return;
+  if (focus.state.kind !== "active" && focus.state.kind !== "starting") return;
+  if (focus.profile_id && focus.profile_id !== profile.id) {
+    notify(
+      "Saved. Focus Mode is running a different profile, so the active session was not changed.",
+    );
+    return;
+  }
   try {
     focus = await invoke<FocusStatus>("apply_profile", { profile });
+    const actionErrors = focus.last_action_errors ?? [];
+    saveStatus = actionErrors.length
+      ? "Saved · needs attention"
+      : "Saved · applied";
+    if (actionErrors.length) notify(actionErrors.join(" · "));
     render();
   } catch (e) {
-    notify("Could not apply profile to the focus session: " + e);
+    notify("Profile saved, but Focus Mode did not apply it: " + e);
   }
 }
 async function setProcessPolicy(process: Process, policy: string) {
@@ -693,6 +786,7 @@ async function toggleFocus() {
         profile,
       });
     }
+    if (!focusActive() && saveStatus.startsWith("Saved ·")) saveStatus = "Saved";
     if (focus.errors.length) notify(focus.errors.join(" · "));
     render();
   } catch (e) {
@@ -863,12 +957,27 @@ document.addEventListener("click", async (event) => {
       case "confirm-remove":
         {
           const p = selected();
+          if (
+            p &&
+            focus.state.kind !== "idle" &&
+            focus.profile_id === p.id
+          ) {
+            notify("Stop Focus Mode before removing the profile it is using.");
+            return;
+          }
           store.profiles = store.profiles.filter((v) => v.id !== p?.id);
           store.selected_profile = store.profiles[0]?.id ?? null;
           save();
           $<HTMLDialogElement>("#dialog")!.close();
           render();
         }
+        break;
+      case "exit-app":
+        if (!native) {
+          notify("Exiting the application is available in the desktop app.");
+          return;
+        }
+        await invoke("exit_app");
         break;
       case "edit-target":
         {
@@ -954,9 +1063,10 @@ async function refresh() {
     if (native) {
       try {
         focus = await invoke<FocusStatus>("get_focus_status");
+        controllerError = "";
         controllerErrorShown = false;
       } catch (e) {
-        $("#sample-state")!.textContent = "Focus status unavailable";
+        controllerError = "Focus controller unavailable: " + e;
         if (!controllerErrorShown) {
           notify("Could not read focus status: " + e);
           controllerErrorShown = true;
@@ -969,10 +1079,14 @@ async function refresh() {
     );
     if (cpuHistory.length > 60) cpuHistory.shift();
     if (memoryHistory.length > 60) memoryHistory.shift();
-    $("#sample-state")!.textContent =
-      (snapshot.demo ? "Demo data" : "Live monitoring") +
-      (focusActive() ? " · Focus Mode active" : " · Read only") +
-      " · Updates every 1s";
+    $("#sample-state")!.textContent = snapshot.monitoring_error
+      ? "Monitoring unavailable: " + snapshot.monitoring_error
+      : controllerError
+        ? "Focus status unavailable"
+        : (snapshot.demo ? "Demo data" : "Live monitoring") +
+          (focusActive() ? " · Focus Mode active" : " · Read only") +
+          " · Updates every 1s";
+    $("#focus-footer")!.textContent = focusLabel();
     if (page === "overview") updateOverview();
     if (page === "processes") updateProcesses();
     const paths = [

@@ -365,9 +365,14 @@ mod win32 {
     }
 
     fn path_is_under(path: &Path, root: &Path) -> bool {
-        path.to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with(&root.to_string_lossy().to_ascii_lowercase())
+        foqus_core::is_path_within(&path.to_string_lossy(), &root.to_string_lossy())
+    }
+
+    fn windows_root() -> PathBuf {
+        std::env::var_os("WINDIR")
+            .or_else(|| std::env::var_os("SystemRoot"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
     }
 
     fn is_protected_name(name: &str) -> bool {
@@ -506,10 +511,7 @@ mod win32 {
                 dwSize: size_of::<PROCESSENTRY32W>() as u32,
                 ..Default::default()
             };
-            let windows_root = std::env::var_os("WINDIR")
-                .or_else(|| std::env::var_os("SystemRoot"))
-                .map(PathBuf::from)
-                .or_else(|| Some(PathBuf::from(r"C:\Windows")));
+            let windows_root = windows_root();
             let current_sid = current_user_sid();
             let current_sid = current_sid.as_deref().map(sid_of);
             let mut out = Vec::new();
@@ -531,8 +533,7 @@ mod win32 {
                         let protected_path = process
                             .path
                             .as_ref()
-                            .zip(windows_root.as_ref())
-                            .is_some_and(|(path, root)| path_is_under(path, root));
+                            .is_some_and(|path| path_is_under(path, &windows_root));
                         let protected = protected_path
                             || is_protected_name(&name)
                             || session_id == Some(0)
@@ -584,6 +585,48 @@ mod win32 {
             out
         }
 
+        fn validate_target(&self, identity: ProcessIdentity) -> Result<(), ControlError> {
+            let handle = open_query(identity)?;
+            let Some(path) = process_path(handle.0) else {
+                return Err(ControlError::Unsupported(
+                    "the executable path is unavailable".into(),
+                ));
+            };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if path_is_under(&path, &windows_root()) {
+                return Err(ControlError::Unsupported(
+                    "Windows system processes cannot be focused".into(),
+                ));
+            }
+            if is_protected_name(&name) {
+                return Err(ControlError::Unsupported(
+                    "protected system processes cannot be focused".into(),
+                ));
+            }
+            match process_session(identity.pid) {
+                Some(0) => {
+                    return Err(ControlError::Unsupported(
+                        "services-session processes cannot be focused".into(),
+                    ));
+                }
+                None => {
+                    return Err(ControlError::AccessDenied);
+                }
+                Some(_) => {}
+            }
+            let sid_buffer = current_user_sid();
+            let Some(expected) = sid_buffer.as_deref().map(sid_of) else {
+                return Err(ControlError::AccessDenied);
+            };
+            if !same_user(handle.0, expected) {
+                return Err(ControlError::AccessDenied);
+            }
+            Ok(())
+        }
+
         fn read_priorities(
             &self,
             identity: ProcessIdentity,
@@ -632,11 +675,30 @@ mod win32 {
         }
     }
 
+    #[derive(Default)]
+    pub struct SampleResult {
+        pub processes: Vec<ProcessSample>,
+        pub memory: Option<(u64, u64)>,
+        pub cpu: Option<f32>,
+        pub error: Option<String>,
+    }
+
     impl WindowsBackend {
-        pub fn sample(&mut self) -> (Vec<ProcessSample>, Option<(u64, u64)>, Option<f32>) {
+        pub fn sample(&mut self) -> SampleResult {
             let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
                 Ok(h) if h != INVALID_HANDLE_VALUE => OwnedHandle(h),
-                _ => return (vec![], None, None),
+                Ok(_) => {
+                    return SampleResult {
+                        error: Some("process snapshot returned an invalid handle".into()),
+                        ..SampleResult::default()
+                    };
+                }
+                Err(error) => {
+                    return SampleResult {
+                        error: Some(format!("process snapshot failed: {}", error.message())),
+                        ..SampleResult::default()
+                    };
+                }
             };
             let mut entry = PROCESSENTRY32W {
                 dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -674,10 +736,7 @@ mod win32 {
                 .unwrap_or(0.0);
             let prior_system = self.previous_system;
             let mut current_cpu = HashMap::new();
-            let windows_root = std::env::var_os("WINDIR")
-                .or_else(|| std::env::var_os("SystemRoot"))
-                .map(PathBuf::from)
-                .or_else(|| Some(PathBuf::from(r"C:\Windows")));
+            let windows_root = windows_root();
             let current_sid = current_user_sid();
             let current_sid = current_sid.as_deref().map(sid_of);
             let mut out = Vec::with_capacity(entries.len());
@@ -713,8 +772,7 @@ mod win32 {
                         .unwrap_or(false);
                     let protected_path = path
                         .as_ref()
-                        .zip(windows_root.as_ref())
-                        .is_some_and(|(p, w)| path_is_under(p, w));
+                        .is_some_and(|path| path_is_under(path, &windows_root));
                     let protected = protected_path
                         || is_protected_name(&name)
                         || session_id == Some(0)
@@ -759,10 +817,15 @@ mod win32 {
                 ),
                 _ => None,
             };
-            (out, memory, cpu)
+            SampleResult {
+                processes: out,
+                memory,
+                cpu,
+                error: None,
+            }
         }
     }
 }
 
 #[cfg(windows)]
-pub use win32::WindowsBackend;
+pub use win32::{SampleResult, WindowsBackend};

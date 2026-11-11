@@ -1,7 +1,7 @@
 use crate::{
     AppliedChange, ChangeOutcome, ControlError, FocusSession, FocusState, GameProfile, PathPolicy,
     ProcessControlBackend, ProcessIdentity, ProcessOutcome, ProcessSample, SessionStatus,
-    classify_path, journal::FocusJournal, unix_seconds,
+    classify_path, journal::FocusJournal, normalize_executable, unix_seconds,
 };
 use std::{
     collections::HashMap,
@@ -16,6 +16,14 @@ pub enum ControllerError {
     Journal(#[from] crate::ProfileError),
     #[error("previous session still needs recovery")]
     RestorePending,
+    #[error("focus session is not active")]
+    NotActive,
+    #[error("profile does not belong to the active focus session")]
+    ProfileMismatch,
+    #[error("target is not eligible for Focus Mode: {0}")]
+    TargetNotEligible(String),
+    #[error("target executable does not match the selected profile")]
+    TargetMismatch,
 }
 
 impl<B: ProcessControlBackend> FocusController<B> {
@@ -26,11 +34,27 @@ impl<B: ProcessControlBackend> FocusController<B> {
             session: None,
             last_scan: None,
             scan_backoff: HashMap::new(),
+            recovery_error: None,
+            action_errors: Vec::new(),
         }
     }
 
     pub fn status(&self) -> SessionStatus {
-        status_of(self.session.as_ref())
+        let mut status = if self.session.is_none()
+            && let Some(message) = self.recovery_error.clone()
+        {
+            SessionStatus {
+                state: FocusState::Error {
+                    message: message.clone(),
+                },
+                errors: vec![message],
+                ..SessionStatus::default()
+            }
+        } else {
+            status_of(self.session.as_ref())
+        };
+        status.last_action_errors = self.action_errors.clone();
+        status
     }
 
     pub fn session(&self) -> Option<&FocusSession> {
@@ -39,6 +63,21 @@ impl<B: ProcessControlBackend> FocusController<B> {
 
     /// Load a journal left by an earlier controller and restore what is still safe.
     pub fn recover_if_needed(&mut self) -> Result<Option<SessionStatus>, ControllerError> {
+        match self.recover_inner() {
+            Ok(status) => {
+                self.recovery_error = None;
+                Ok(status)
+            }
+            Err(error) => {
+                self.recovery_error = Some(format!(
+                    "could not recover the previous focus session: {error}"
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    fn recover_inner(&mut self) -> Result<Option<SessionStatus>, ControllerError> {
         let Some(journal) = FocusJournal::load(&self.journal_path)? else {
             return Ok(None);
         };
@@ -60,6 +99,12 @@ impl<B: ProcessControlBackend> FocusController<B> {
         target: ProcessIdentity,
         profile: GameProfile,
     ) -> Result<SessionStatus, ControllerError> {
+        if self.recovery_error.is_some() {
+            // Never write a new journal over an unreadable one: the unknown
+            // original priorities would be lost.
+            return Err(ControllerError::RestorePending);
+        }
+        self.validate_target(target, &profile)?;
         if self.session.is_some() {
             let restored = self.stop();
             if !matches!(restored.state, FocusState::Idle) {
@@ -83,7 +128,10 @@ impl<B: ProcessControlBackend> FocusController<B> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("pid {}", target.pid));
         let target_result = self.apply_target(target, &target_name)?;
-        let target_ok = matches!(target_result.outcome, ChangeOutcome::Applied);
+        let target_ok = matches!(
+            target_result.outcome,
+            ChangeOutcome::Applied | ChangeOutcome::Skipped
+        );
         self.push_outcome(target_result.clone());
         if !target_ok {
             self.session_mut().state = FocusState::Error {
@@ -143,12 +191,53 @@ impl<B: ProcessControlBackend> FocusController<B> {
 
         self.session_mut().state = FocusState::Active {
             started_at_unix: unix_seconds(SystemTime::now()),
+            target_exited: false,
         };
         if let Err(error) = self.persist() {
             let _ = self.restore_all();
             return Err(error);
         }
         Ok(self.status())
+    }
+
+    fn validate_target(
+        &self,
+        target: ProcessIdentity,
+        profile: &GameProfile,
+    ) -> Result<(), ControllerError> {
+        if profile.id.trim().is_empty() || profile.executable_path.as_os_str().is_empty() {
+            return Err(ControllerError::TargetNotEligible(
+                "the profile needs an id and an executable path".into(),
+            ));
+        }
+        self.backend
+            .validate_target(target)
+            .map_err(|error| ControllerError::TargetNotEligible(error.to_string()))?;
+        let sample = self
+            .backend
+            .list_processes()
+            .into_iter()
+            .find(|sample| sample.identity == target)
+            .ok_or_else(|| {
+                ControllerError::TargetNotEligible("the process is no longer running".into())
+            })?;
+        if sample.state != crate::ProcessState::Running {
+            return Err(ControllerError::TargetNotEligible(
+                "the process cannot be queried".into(),
+            ));
+        }
+        if sample.capability == crate::ProcessCapability::SystemProtected {
+            return Err(ControllerError::TargetNotEligible(
+                "protected system processes cannot be focused".into(),
+            ));
+        }
+        let path = sample.executable_path.as_deref().ok_or_else(|| {
+            ControllerError::TargetNotEligible("the executable path is unavailable".into())
+        })?;
+        if normalize_executable(path) != normalize_executable(&profile.executable_path) {
+            return Err(ControllerError::TargetMismatch);
+        }
+        Ok(())
     }
 
     pub fn stop(&mut self) -> SessionStatus {
@@ -158,15 +247,38 @@ impl<B: ProcessControlBackend> FocusController<B> {
     /// Called by the UI poll. A game that exited or a reused PID triggers restore.
     pub fn tick(&mut self) -> SessionStatus {
         let Some(session) = self.session.as_ref() else {
-            return SessionStatus::default();
+            return self.status();
         };
-        if !matches!(session.state, FocusState::Active { .. }) {
+        let (target, target_exited, restore_on_exit, target_name) = match &session.state {
+            FocusState::Active { target_exited, .. } => (
+                session.target,
+                *target_exited,
+                session.profile_snapshot.restore_when_game_exits,
+                session
+                    .profile_snapshot
+                    .executable_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("pid {}", session.target.pid)),
+            ),
+            _ => return self.status(),
+        };
+        if target_exited {
             return self.status();
         }
-        if let Err(ControlError::Exited | ControlError::IdentityChanged) =
-            self.backend.read_priorities(session.target)
-        {
-            return self.restore_all();
+        match self.backend.read_priorities(target) {
+            Ok(_) => {}
+            Err(ControlError::Exited | ControlError::IdentityChanged) => {
+                if restore_on_exit {
+                    return self.restore_all();
+                }
+                self.mark_target_exited(&target_name);
+                return self.status();
+            }
+            Err(error) => {
+                self.record_error(format!("could not monitor the focused game: {error}"));
+                return self.status();
+            }
         }
         if self
             .last_scan
@@ -175,6 +287,54 @@ impl<B: ProcessControlBackend> FocusController<B> {
             self.scan_managed();
         }
         self.status()
+    }
+
+    fn mark_target_exited(&mut self, name: &str) {
+        const MESSAGE: &str = "game exited; applied priorities stay in place because restore when the game exits is off. Stop Focus Mode to restore them.";
+        if let Some(session) = self.session.as_mut() {
+            let started_at_unix = match session.state {
+                FocusState::Active {
+                    started_at_unix, ..
+                } => started_at_unix,
+                _ => return,
+            };
+            session.state = FocusState::Active {
+                started_at_unix,
+                target_exited: true,
+            };
+            if !session.errors.iter().any(|error| error == MESSAGE) {
+                session.errors.push(MESSAGE.into());
+            }
+            let identity = session.target;
+            session.outcomes.push(ProcessOutcome {
+                identity,
+                name: name.into(),
+                outcome: ChangeOutcome::Skipped,
+                message: Some(MESSAGE.into()),
+                partial: false,
+            });
+            if session.outcomes.len() > 200 {
+                let excess = session.outcomes.len() - 200;
+                session.outcomes.drain(0..excess);
+            }
+        }
+        let _ = self.persist();
+    }
+
+    fn record_error(&mut self, message: String) {
+        if let Some(session) = self.session.as_mut()
+            && !session.errors.contains(&message)
+        {
+            session.errors.push(message);
+        }
+        let _ = self.persist();
+    }
+
+    fn record_action_error(&mut self, message: String) {
+        if !self.action_errors.contains(&message) {
+            self.action_errors.push(message.clone());
+        }
+        self.record_error(message);
     }
 
     fn scan_managed(&mut self) {
@@ -224,7 +384,10 @@ impl<B: ProcessControlBackend> FocusController<B> {
                     }
                     self.push_outcome(outcome);
                 }
-                Err(_) => {
+                Err(error) => {
+                    self.record_error(format!(
+                        "{name}: could not update the focus journal: {error}"
+                    ));
                     self.scan_backoff.insert(sample.identity, Instant::now());
                 }
             }
@@ -235,37 +398,143 @@ impl<B: ProcessControlBackend> FocusController<B> {
     }
 
     pub fn retry_restore(&mut self) -> SessionStatus {
+        if self.session.is_none() && self.recovery_error.is_some() {
+            self.recovery_error = None;
+            let _ = self.recover_if_needed();
+            if self.session.is_none() {
+                return self.status();
+            }
+        }
         self.restore_all()
     }
 
-    /// Apply a profile change. Excluding a process immediately restores Foqus changes.
+    /// Apply a profile change that belongs to the active session.
+    ///
+    /// A profile is bound to the session by id and executable path, so editing
+    /// or saving a different game's profile can never rewrite the active
+    /// snapshot. The running policy is reconciled immediately: removed
+    /// managed entries (Auto), new exclusions and the memory toggle restore or
+    /// apply changes without losing the original values recorded in the
+    /// journal.
     pub fn update_profile(
         &mut self,
         profile: GameProfile,
     ) -> Result<SessionStatus, ControllerError> {
         let Some(session) = self.session.as_ref() else {
-            return Ok(self.status());
+            return Err(ControllerError::NotActive);
         };
+        if !matches!(
+            session.state,
+            FocusState::Active { .. } | FocusState::Starting
+        ) {
+            return Err(ControllerError::NotActive);
+        }
+        self.action_errors.clear();
+        let bound_to_session = profile.id == session.profile_snapshot.id
+            && normalize_executable(&profile.executable_path)
+                == normalize_executable(&session.profile_snapshot.executable_path);
+        if !bound_to_session {
+            return Err(ControllerError::ProfileMismatch);
+        }
         let target = session.target;
-        let excluded: Vec<ProcessIdentity> = session
-            .changes
-            .iter()
-            .filter(|change| {
-                change.executable_path.as_deref().is_some_and(|path| {
-                    path != profile.executable_path
-                        && classify_path(&profile, path) == PathPolicy::Excluded
-                })
-            })
-            .map(|change| change.identity)
-            .collect();
-        self.session_mut().profile_snapshot = profile;
-        for identity in excluded {
-            if identity != target {
-                self.restore_process(identity);
+        let target_exited = matches!(
+            session.state,
+            FocusState::Active {
+                target_exited: true,
+                ..
+            }
+        );
+        if target_exited && profile.restore_when_game_exits {
+            self.session_mut().profile_snapshot = profile;
+            return Ok(self.restore_all());
+        }
+        if classify_path(&profile, &profile.executable_path) == PathPolicy::Excluded {
+            self.record_action_error(
+                "the active game cannot be excluded while Focus Mode is running; stop Focus Mode first"
+                    .into(),
+            );
+        }
+        self.session_mut().profile_snapshot = profile.clone();
+
+        // Restore any process Foqus changed that is no longer managed.
+        let changes = self
+            .session()
+            .map(|session| session.changes.clone())
+            .unwrap_or_default();
+        for change in changes {
+            if change.identity == target {
+                continue;
+            }
+            let Some(path) = change.executable_path.as_deref() else {
+                continue;
+            };
+            if classify_path(&profile, path) != PathPolicy::Managed {
+                self.restore_process(change.identity);
             }
         }
+
+        // Apply the policy to currently running processes and reconcile the
+        // memory-priority toggle for processes already tracked.
+        self.reconcile_managed_processes(&profile, target);
         self.persist()?;
         Ok(self.status())
+    }
+
+    fn reconcile_managed_processes(&mut self, profile: &GameProfile, target: ProcessIdentity) {
+        let samples = self.backend.list_processes();
+        for sample in samples {
+            if sample.identity == target
+                || sample.capability == crate::ProcessCapability::SystemProtected
+                || sample.state == crate::ProcessState::AccessDenied
+            {
+                continue;
+            }
+            let Some(path) = sample.executable_path.as_deref() else {
+                continue;
+            };
+            if classify_path(profile, path) != PathPolicy::Managed {
+                continue;
+            }
+            let existing = self
+                .session()
+                .and_then(|session| {
+                    session
+                        .changes
+                        .iter()
+                        .find(|change| change.identity == sample.identity)
+                })
+                .cloned();
+            match existing {
+                Some(change) if profile.reduce_background_memory => {
+                    if change.applied_memory_priority.is_none()
+                        && let Some(outcome) = self.apply_memory_change(&change, &sample.name)
+                    {
+                        self.record_action_failure(&outcome);
+                    }
+                }
+                Some(change) => {
+                    if change.applied_memory_priority.is_some()
+                        && let Some(outcome) = self.restore_memory_change(&change)
+                    {
+                        self.record_action_failure(&outcome);
+                    }
+                }
+                None => match self.apply_background(&sample, &sample.name, profile) {
+                    Ok(outcome) => {
+                        if !matches!(outcome.outcome, ChangeOutcome::Skipped) {
+                            self.push_outcome(outcome.clone());
+                        }
+                        self.record_action_failure(&outcome);
+                    }
+                    Err(error) => {
+                        self.record_action_error(format!(
+                            "{}: could not update the focus journal: {error}",
+                            sample.name
+                        ));
+                    }
+                },
+            }
+        }
     }
 
     /// Restore one process immediately (used when the user excludes it).
@@ -281,8 +550,172 @@ impl<B: ProcessControlBackend> FocusController<B> {
         if complete && let Some(session) = self.session.as_mut() {
             session.changes.retain(|item| item.identity != identity);
         }
+        self.record_action_failure(&outcome);
         self.push_outcome(outcome.clone());
         let _ = self.persist();
+        Some(outcome)
+    }
+
+    /// Make action failures visible both in `SessionStatus.errors` and in the
+    /// action-scoped list used by the UI's saved/attention indicator.
+    fn record_action_failure(&mut self, outcome: &ProcessOutcome) {
+        let failed = !matches!(
+            outcome.outcome,
+            ChangeOutcome::Applied
+                | ChangeOutcome::Excluded
+                | ChangeOutcome::Exited
+                | ChangeOutcome::Skipped
+        ) || outcome.partial;
+        if !failed {
+            return;
+        }
+        let message = outcome
+            .message
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", outcome.outcome));
+        self.record_action_error(format!("{}: {message}", outcome.name));
+    }
+
+    /// Apply the low memory priority to a process Foqus is already managing,
+    /// keeping the original value recorded for restore.
+    fn apply_memory_change(
+        &mut self,
+        change: &AppliedChange,
+        name: &str,
+    ) -> Option<ProcessOutcome> {
+        let identity = change.identity;
+        let current = match self.backend.read_priorities(identity) {
+            Ok(value) => value,
+            Err(error) => {
+                let outcome = outcome_for(identity, name, error);
+                self.push_outcome(outcome.clone());
+                return Some(outcome);
+            }
+        };
+        let Some(original) = current.memory else {
+            let outcome = ProcessOutcome {
+                identity,
+                name: name.into(),
+                outcome: ChangeOutcome::AccessDenied,
+                message: Some("memory priority could not be read; left unchanged".into()),
+                partial: false,
+            };
+            self.push_outcome(outcome.clone());
+            return Some(outcome);
+        };
+        if original <= crate::BACKGROUND_MEMORY_PRIORITY {
+            return None;
+        }
+        let mut pending = change.clone();
+        pending.original_memory_priority = Some(original);
+        pending.applied_memory_priority = Some(crate::BACKGROUND_MEMORY_PRIORITY);
+        if let Err(error) = self.upsert_change(pending) {
+            self.record_action_error(format!(
+                "{name}: could not update the focus journal: {error}"
+            ));
+            return None;
+        }
+        let outcome = match self
+            .backend
+            .set_memory_priority(identity, crate::BACKGROUND_MEMORY_PRIORITY)
+        {
+            Ok(()) => ProcessOutcome {
+                identity,
+                name: name.into(),
+                outcome: ChangeOutcome::Applied,
+                message: Some("memory priority reduced".into()),
+                partial: false,
+            },
+            Err(error) => {
+                let mut reverted = change.clone();
+                reverted.original_memory_priority = None;
+                reverted.applied_memory_priority = None;
+                let _ = self.upsert_change(reverted);
+                outcome_for(identity, name, error)
+            }
+        };
+        self.push_outcome(outcome.clone());
+        Some(outcome)
+    }
+
+    /// Restore only the memory priority, leaving a CPU change in place.
+    fn restore_memory_change(&mut self, change: &AppliedChange) -> Option<ProcessOutcome> {
+        let (Some(original), Some(applied)) = (
+            change.original_memory_priority,
+            change.applied_memory_priority,
+        ) else {
+            return None;
+        };
+        let identity = change.identity;
+        let name = change_name(change);
+        let current = match self.backend.read_priorities(identity) {
+            Ok(value) => value,
+            Err(ControlError::Exited | ControlError::IdentityChanged) => {
+                let _ = self.remove_change(identity);
+                let outcome = ProcessOutcome {
+                    identity,
+                    name,
+                    outcome: ChangeOutcome::Exited,
+                    message: Some("process exited or PID was reused; nothing to restore".into()),
+                    partial: false,
+                };
+                self.push_outcome(outcome.clone());
+                return Some(outcome);
+            }
+            Err(error) => {
+                let outcome = outcome_for(identity, &name, error);
+                self.push_outcome(outcome.clone());
+                return Some(outcome);
+            }
+        };
+        let outcome = match current.memory {
+            Some(value) if value == applied => {
+                if let Err(error) = self.backend.set_memory_priority(identity, original) {
+                    let outcome = outcome_for(identity, &name, error);
+                    self.push_outcome(outcome.clone());
+                    return Some(outcome);
+                }
+                ProcessOutcome {
+                    identity,
+                    name: name.clone(),
+                    outcome: ChangeOutcome::Applied,
+                    message: Some("memory priority restored".into()),
+                    partial: false,
+                }
+            }
+            Some(value) if value == original => ProcessOutcome {
+                identity,
+                name: name.clone(),
+                outcome: ChangeOutcome::Applied,
+                message: Some("memory priority already restored".into()),
+                partial: false,
+            },
+            Some(value) => ProcessOutcome {
+                identity,
+                name: name.clone(),
+                outcome: ChangeOutcome::Conflict,
+                message: Some(format!(
+                    "memory priority changed outside Foqus (expected {applied}, found {value})"
+                )),
+                partial: false,
+            },
+            None => ProcessOutcome {
+                identity,
+                name: name.clone(),
+                outcome: ChangeOutcome::Conflict,
+                message: Some("memory priority could not be read during restore".into()),
+                partial: false,
+            },
+        };
+        let mut updated = change.clone();
+        updated.original_memory_priority = None;
+        updated.applied_memory_priority = None;
+        if updated.applied_cpu_priority.is_some() {
+            let _ = self.upsert_change(updated);
+        } else {
+            let _ = self.remove_change(identity);
+        }
+        self.push_outcome(outcome.clone());
         Some(outcome)
     }
 
@@ -296,7 +729,10 @@ impl<B: ProcessControlBackend> FocusController<B> {
         let mut errors = Vec::new();
         for change in changes {
             let (outcome, complete) = self.restore_change(&change);
-            if !matches!(outcome.outcome, ChangeOutcome::Applied) {
+            if !matches!(
+                outcome.outcome,
+                ChangeOutcome::Applied | ChangeOutcome::Exited
+            ) {
                 errors.push(format!(
                     "{}: {}",
                     outcome.name,
@@ -341,14 +777,28 @@ impl<B: ProcessControlBackend> FocusController<B> {
             Ok(value) => value,
             Err(error) => return Ok(outcome_for(identity, name, error)),
         };
-        if current.cpu == crate::GAME_CPU_PRIORITY {
-            return Ok(ProcessOutcome {
-                identity,
-                name: name.into(),
-                outcome: ChangeOutcome::Applied,
-                message: Some("already above normal".into()),
-                partial: false,
-            });
+        match cpu_priority_rank(current.cpu).cmp(&cpu_priority_rank(crate::GAME_CPU_PRIORITY)) {
+            std::cmp::Ordering::Equal => {
+                return Ok(ProcessOutcome {
+                    identity,
+                    name: name.into(),
+                    outcome: ChangeOutcome::Skipped,
+                    message: Some("already above normal; no change needed".into()),
+                    partial: false,
+                });
+            }
+            std::cmp::Ordering::Greater => {
+                return Ok(ProcessOutcome {
+                    identity,
+                    name: name.into(),
+                    outcome: ChangeOutcome::Skipped,
+                    message: Some(
+                        "already at a higher priority than above normal; left unchanged".into(),
+                    ),
+                    partial: false,
+                });
+            }
+            std::cmp::Ordering::Less => {}
         }
         let change = AppliedChange {
             identity,
@@ -397,7 +847,7 @@ impl<B: ProcessControlBackend> FocusController<B> {
         };
         let mut messages = Vec::new();
         let mut applied = false;
-        if current.cpu != crate::BACKGROUND_CPU_PRIORITY {
+        if cpu_priority_rank(current.cpu) > cpu_priority_rank(crate::BACKGROUND_CPU_PRIORITY) {
             change.original_cpu_priority = Some(current.cpu);
             change.applied_cpu_priority = Some(crate::BACKGROUND_CPU_PRIORITY);
             self.upsert_change(change.clone())?;
@@ -419,7 +869,7 @@ impl<B: ProcessControlBackend> FocusController<B> {
         }
         if profile.reduce_background_memory {
             match current.memory {
-                Some(original) if original != crate::BACKGROUND_MEMORY_PRIORITY => {
+                Some(original) if original > crate::BACKGROUND_MEMORY_PRIORITY => {
                     let mut pending = change.clone();
                     pending.original_memory_priority = Some(original);
                     pending.applied_memory_priority = Some(crate::BACKGROUND_MEMORY_PRIORITY);
@@ -633,13 +1083,37 @@ fn status_of(session: Option<&FocusSession>) -> SessionStatus {
         Some(session) => SessionStatus {
             state: session.state.clone(),
             target: Some(session.target),
+            profile_id: Some(session.profile_snapshot.id.clone()),
             profile_name: Some(session.profile_snapshot.name.clone()),
             outcomes: session.outcomes.clone(),
             errors: session.errors.clone(),
+            last_action_errors: vec![],
             applied_changes: session.changes.len(),
         },
         None => SessionStatus::default(),
     }
+}
+
+/// Win32 priority classes ordered from lowest to highest preference.
+fn cpu_priority_rank(priority: u32) -> u8 {
+    match priority {
+        0x0000_0040 => 0, // IDLE_PRIORITY_CLASS
+        0x0000_4000 => 1, // BELOW_NORMAL_PRIORITY_CLASS
+        0x0000_0020 => 2, // NORMAL_PRIORITY_CLASS
+        0x0000_8000 => 3, // ABOVE_NORMAL_PRIORITY_CLASS
+        0x0000_0080 => 4, // HIGH_PRIORITY_CLASS
+        0x0000_0100 => 5, // REALTIME_PRIORITY_CLASS
+        _ => 2,
+    }
+}
+
+fn change_name(change: &AppliedChange) -> String {
+    change
+        .executable_path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("pid {}", change.identity.pid))
 }
 
 pub struct FocusController<B: ProcessControlBackend> {
@@ -648,6 +1122,8 @@ pub struct FocusController<B: ProcessControlBackend> {
     session: Option<FocusSession>,
     last_scan: Option<Instant>,
     scan_backoff: HashMap<ProcessIdentity, Instant>,
+    recovery_error: Option<String>,
+    action_errors: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1001,5 +1477,424 @@ mod tests {
             0x20
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_update_is_bound_to_session_identity_and_executable() {
+        let (mut controller, path) = controller();
+        controller.start(identity(1), profile()).unwrap();
+
+        let mut other_profile = profile();
+        other_profile.id = "other".into();
+        other_profile.managed_executables = vec![PathBuf::from(r"C:\Apps\other.exe")];
+        assert!(matches!(
+            controller.update_profile(other_profile).unwrap_err(),
+            ControllerError::ProfileMismatch
+        ));
+        let snapshot = controller.session().unwrap().profile_snapshot.clone();
+        assert_eq!(snapshot.id, "p");
+        assert_eq!(snapshot.managed_executables, profile().managed_executables);
+
+        let mut wrong_executable = profile();
+        wrong_executable.executable_path = PathBuf::from(r"C:\Games\other.exe");
+        assert!(matches!(
+            controller.update_profile(wrong_executable).unwrap_err(),
+            ControllerError::ProfileMismatch
+        ));
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(2)].cpu,
+            crate::BACKGROUND_CPU_PRIORITY
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn manage_then_auto_applies_and_restores_a_running_process() {
+        let (mut controller, path) = controller();
+        controller.start(identity(1), profile()).unwrap();
+
+        let mut managed = profile();
+        managed.excluded_executables.clear();
+        controller.update_profile(managed).unwrap();
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(3)].cpu,
+            crate::BACKGROUND_CPU_PRIORITY
+        );
+
+        let mut automatic = profile();
+        automatic.excluded_executables.clear();
+        automatic
+            .managed_executables
+            .retain(|path| path != Path::new(r"C:\Apps\excluded.exe"));
+        controller.update_profile(automatic).unwrap();
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(3)].cpu,
+            0x20
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn memory_toggle_off_restores_memory_and_keeps_cpu_managed() {
+        let (mut controller, path) = controller();
+        controller.start(identity(1), profile()).unwrap();
+        let mut changed = profile();
+        changed.reduce_background_memory = false;
+        controller.update_profile(changed).unwrap();
+
+        let values = controller.backend.priorities.lock().unwrap();
+        assert_eq!(values[&identity(2)].cpu, crate::BACKGROUND_CPU_PRIORITY);
+        assert_eq!(values[&identity(2)].memory, Some(5));
+        let change = controller
+            .session()
+            .unwrap()
+            .changes
+            .iter()
+            .find(|change| change.identity == identity(2))
+            .unwrap();
+        assert!(change.applied_cpu_priority.is_some());
+        assert!(change.applied_memory_priority.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn memory_toggle_on_applies_low_priority_and_restores_it() {
+        let (mut controller, path) = controller();
+        let mut initial = profile();
+        initial.reduce_background_memory = false;
+        controller.start(identity(1), initial.clone()).unwrap();
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(2)].memory,
+            Some(5)
+        );
+
+        let mut changed = initial;
+        changed.reduce_background_memory = true;
+        controller.update_profile(changed).unwrap();
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(2)].memory,
+            Some(crate::BACKGROUND_MEMORY_PRIORITY)
+        );
+        assert!(matches!(controller.stop().state, FocusState::Idle));
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(2)].memory,
+            Some(5)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restore_when_game_exits_off_holds_changes_until_manual_stop() {
+        let (mut controller, path) = controller();
+        let mut profile = profile();
+        profile.restore_when_game_exits = false;
+        controller.start(identity(1), profile).unwrap();
+        controller
+            .backend
+            .priorities
+            .lock()
+            .unwrap()
+            .remove(&identity(1));
+
+        let status = controller.tick();
+        assert!(matches!(
+            status.state,
+            FocusState::Active {
+                target_exited: true,
+                ..
+            }
+        ));
+        assert!(status.errors.iter().any(|error| error.contains("restore")));
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(2)].cpu,
+            crate::BACKGROUND_CPU_PRIORITY
+        );
+        assert!(matches!(
+            controller.tick().state,
+            FocusState::Active {
+                target_exited: true,
+                ..
+            }
+        ));
+
+        let status = controller.stop();
+        assert!(matches!(status.state, FocusState::Idle));
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(2)].cpu,
+            0x20
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn game_already_above_normal_is_reported_as_noop() {
+        let (mut controller, path) = controller();
+        controller
+            .backend
+            .priorities
+            .lock()
+            .unwrap()
+            .get_mut(&identity(1))
+            .unwrap()
+            .cpu = crate::GAME_CPU_PRIORITY;
+        let status = controller.start(identity(1), profile()).unwrap();
+        assert!(matches!(status.state, FocusState::Active { .. }));
+        let target_outcome = status
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.identity == identity(1))
+            .unwrap();
+        assert_eq!(target_outcome.outcome, ChangeOutcome::Skipped);
+        assert!(
+            target_outcome
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("already above normal"))
+        );
+        assert!(
+            controller
+                .session()
+                .unwrap()
+                .changes
+                .iter()
+                .all(|change| change.identity != identity(1))
+        );
+        controller.stop();
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(1)].cpu,
+            crate::GAME_CPU_PRIORITY
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn game_already_above_normal_is_left_unchanged() {
+        let (mut controller, path) = controller();
+        controller
+            .backend
+            .priorities
+            .lock()
+            .unwrap()
+            .get_mut(&identity(1))
+            .unwrap()
+            .cpu = 0x0000_0080;
+        let status = controller.start(identity(1), profile()).unwrap();
+        assert!(matches!(status.state, FocusState::Active { .. }));
+        assert!(
+            status
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.identity == identity(1)
+                    && outcome.outcome == ChangeOutcome::Skipped)
+        );
+        controller.stop();
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(1)].cpu,
+            0x0000_0080
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn protected_or_mismatched_targets_are_rejected_natively() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100);
+        let path = std::env::temp_dir().join(format!(
+            "foqus-target-test-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut protected = sample(1, r"C:\Games\game.exe");
+        protected.capability = ProcessCapability::SystemProtected;
+        let backend = MockBackend::new(&[(identity(1), 0x20)], vec![protected]);
+        let mut controller = FocusController::new(backend, path.clone());
+        assert!(matches!(
+            controller.start(identity(1), profile()).unwrap_err(),
+            ControllerError::TargetNotEligible(_)
+        ));
+
+        let backend = MockBackend::new(
+            &[(identity(1), 0x20)],
+            vec![sample(1, r"C:\Games\game.exe")],
+        );
+        let mut controller = FocusController::new(backend, path.clone());
+        let mut wrong_path = profile();
+        wrong_path.executable_path = PathBuf::from(r"C:\Games\other.exe");
+        assert!(matches!(
+            controller.start(identity(1), wrong_path).unwrap_err(),
+            ControllerError::TargetMismatch
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_update_after_stop_does_not_apply_changes() {
+        let (mut controller, path) = controller();
+        controller.start(identity(1), profile()).unwrap();
+        assert!(matches!(controller.stop().state, FocusState::Idle));
+        let mut changed = profile();
+        changed.excluded_executables.clear();
+        changed
+            .managed_executables
+            .push(PathBuf::from(r"C:\Apps\excluded.exe"));
+        assert!(matches!(
+            controller.update_profile(changed).unwrap_err(),
+            ControllerError::NotActive
+        ));
+        assert_eq!(
+            controller.backend.priorities.lock().unwrap()[&identity(3)].cpu,
+            0x20
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_profile_is_rejected_while_session_is_in_error() {
+        let (mut controller, path) = controller();
+        controller
+            .backend
+            .fail_cpu
+            .lock()
+            .unwrap()
+            .push(identity(1));
+        assert!(matches!(
+            controller.start(identity(1), profile()).unwrap().state,
+            FocusState::Error { .. }
+        ));
+        assert!(matches!(
+            controller.update_profile(profile()).unwrap_err(),
+            ControllerError::NotActive
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_profile_is_rejected_while_stopping_or_recovering() {
+        let (mut controller, path) = controller();
+        controller.start(identity(1), profile()).unwrap();
+        for state in [FocusState::Stopping, FocusState::Recovery] {
+            controller.session_mut().state = state;
+            assert!(matches!(
+                controller.update_profile(profile()).unwrap_err(),
+                ControllerError::NotActive
+            ));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exclude_reconciliation_conflict_is_surfaced_in_status() {
+        let (mut controller, path) = controller();
+        controller.start(identity(1), profile()).unwrap();
+        controller
+            .backend
+            .priorities
+            .lock()
+            .unwrap()
+            .get_mut(&identity(2))
+            .unwrap()
+            .cpu = 0x0000_0040;
+        let mut changed = profile();
+        changed
+            .excluded_executables
+            .push(PathBuf::from(r"C:\Apps\managed.exe"));
+        let status = controller.update_profile(changed).unwrap();
+        assert!(matches!(status.state, FocusState::Active { .. }));
+        assert!(status.errors.iter().any(|error| {
+            error.contains("managed.exe") && error.contains("changed outside Foqus")
+        }));
+        assert!(
+            status
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.identity == identity(2)
+                    && outcome.outcome == ChangeOutcome::Conflict)
+        );
+        assert!(
+            status
+                .last_action_errors
+                .iter()
+                .any(|error| error.contains("managed.exe"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn action_errors_are_scoped_to_the_latest_profile_update() {
+        let (mut controller, path) = controller();
+        let mut profile = profile();
+        profile.restore_when_game_exits = false;
+        controller.start(identity(1), profile.clone()).unwrap();
+        controller
+            .backend
+            .priorities
+            .lock()
+            .unwrap()
+            .remove(&identity(1));
+        let exited = controller.tick();
+        assert!(!exited.errors.is_empty(), "target-exit notice is expected");
+
+        let mut changed = profile.clone();
+        changed.reduce_background_memory = false;
+        let successful = controller.update_profile(changed).unwrap();
+        assert!(
+            successful.last_action_errors.is_empty(),
+            "historical session errors must not mark a successful apply"
+        );
+        assert!(!successful.errors.is_empty());
+
+        controller
+            .backend
+            .priorities
+            .lock()
+            .unwrap()
+            .get_mut(&identity(2))
+            .unwrap()
+            .cpu = 0x0000_0040;
+        let mut conflicting = profile;
+        conflicting
+            .excluded_executables
+            .push(PathBuf::from(r"C:\Apps\managed.exe"));
+        let status = controller.update_profile(conflicting).unwrap();
+        assert!(
+            status
+                .last_action_errors
+                .iter()
+                .any(|error| error.contains("managed.exe"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_journal_recovery_failure_is_surfaced() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(200);
+        let path = std::env::temp_dir().join(format!(
+            "foqus-recovery-test-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let backend = MockBackend::new(
+            &[(identity(1), 0x20)],
+            vec![sample(1, r"C:\Games\game.exe")],
+        );
+        let mut controller = FocusController::new(backend, path.clone());
+        assert!(controller.recover_if_needed().is_err());
+        let status = controller.status();
+        assert!(matches!(status.state, FocusState::Error { .. }));
+        assert!(!status.errors.is_empty());
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            controller.start(identity(1), profile()).unwrap_err(),
+            ControllerError::RestorePending
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "an unreadable journal must never be overwritten by a new session"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(controller.retry_restore().state, FocusState::Idle));
     }
 }
