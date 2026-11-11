@@ -8,6 +8,7 @@ license.workspace = true
 foqus-core = { path = "../foqus-core" }
 foqus-windows = { path = "../foqus-windows" }
 tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

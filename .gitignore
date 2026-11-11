@@ -4,3 +4,4 @@
 /crates/foqus-app/gen/
 /artifacts/
 *.log
+.DS_Store

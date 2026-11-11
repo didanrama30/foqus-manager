@@ -65,6 +65,24 @@ try {
             return;
           }
           if (command === "get_icon") return null;
+          if (command === "get_focus_status")
+            return {
+              state: { kind: "idle" },
+              target: null,
+              profile_name: null,
+              outcomes: [],
+              errors: [],
+              applied_changes: 0,
+            };
+          if (command === "apply_profile")
+            return {
+              state: { kind: "idle" },
+              target: null,
+              profile_name: args.profile?.name ?? null,
+              outcomes: [],
+              errors: [],
+              applied_changes: 0,
+            };
           if (command === "get_snapshot")
             return {
               cpu: 42,
@@ -72,7 +90,7 @@ try {
               demo: false,
               processes: [
                 {
-                  identity: { pid: 101, creation_time_100ns: 1001 },
+                  identity: { pid: 101, creation_time_100ns: "1001" },
                   name: "Cyberpunk2077.exe",
                   executable_path: "C:\\Games\\Cyberpunk2077.exe",
                   cpu_percent: 32,
@@ -80,7 +98,7 @@ try {
                   capability: "Candidate",
                 },
                 {
-                  identity: { pid: 102, creation_time_100ns: 1002 },
+                  identity: { pid: 102, creation_time_100ns: "1002" },
                   name: "chrome.exe",
                   executable_path: "C:\\Program Files\\Chrome\\chrome.exe",
                   cpu_percent: 5,
@@ -88,7 +106,7 @@ try {
                   capability: "Candidate",
                 },
                 {
-                  identity: { pid: 103, creation_time_100ns: 1003 },
+                  identity: { pid: 103, creation_time_100ns: "1003" },
                   name: "System.exe",
                   executable_path: "C:\\Windows\\System.exe",
                   cpu_percent: 1,
@@ -137,6 +155,22 @@ try {
   const badges = await page.locator("#process-body .badge").allTextContents();
   assert(badges.every((text) => text === "System protected"));
   await page.locator("#process-filter").selectOption("all");
+  await page
+    .locator('#process-body tr')
+    .first()
+    .locator('[data-policy="manage"]')
+    .click();
+  await page.waitForFunction(
+    () => window.__saved?.profiles[0].managed_executables.length === 1,
+  );
+  await page
+    .locator('#process-body tr')
+    .first()
+    .locator('[data-policy="auto"]')
+    .click();
+  await page.waitForFunction(
+    () => window.__saved?.profiles[0].managed_executables.length === 0,
+  );
   await mkdir("artifacts", { recursive: true });
   for (const width of [1000, 1280]) {
     await page.setViewportSize({ width, height: 760 });

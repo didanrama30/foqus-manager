@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v1.0.0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build and validate Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify version consistency
+        shell: pwsh
+        run: |
+          $pkg = (Get-Content package.json | ConvertFrom-Json).version
+          $tauri = (Get-Content crates/foqus-app/tauri.conf.json | ConvertFrom-Json).version
+          $cargoLine = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Line
+          $cargo = [regex]::Match($cargoLine, '"(.+)"').Groups[1].Value
+          if ($pkg -ne $tauri -or $pkg -ne $cargo) {
+            throw "Version mismatch: package=$pkg tauri=$tauri cargo=$cargo"
+          }
+          if (($env:GITHUB_REF -like 'refs/tags/*') -and ("v$pkg" -ne "$env:GITHUB_REF_NAME")) {
+            throw "Tag $env:GITHUB_REF_NAME does not match version v$pkg"
+          }
+
+      - name: Show Rust toolchain
+        run: rustup show
+
+      - name: Install pinned Rust toolchain and target
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: npm.cmd ci
+
+      - name: Build frontend
+        run: npm.cmd run build
+
+      - name: UI smoke test
+        run: npm.cmd run check:ui
+
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Rust checks
+        run: cargo check --workspace --locked
+
+      - name: Rust tests
+        run: cargo test --workspace --locked
+
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build desktop executable
+        run: npm.cmd run desktop:build
+
+      - name: Stage release executable
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $name = "Foqus-Manager-$version-windows-x64.exe"
+          New-Item -ItemType Directory -Force -Path dist-release | Out-Null
+          Copy-Item target/release/foqus-app.exe "dist-release/$name"
+          $hash = (Get-FileHash "dist-release/$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Set-Content dist-release/SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foqus-manager-windows-x64
+          path: dist-release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: foqus-manager-windows-x64
+          path: dist-release
+
+      - name: Create release v1.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace published assets." >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist-release/*.exe dist-release/SHA256.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Foqus Manager $GITHUB_REF_NAME" \
+            --generate-notes

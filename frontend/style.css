@@ -495,6 +495,34 @@ th:nth-child(5) {
   background: #153d30;
   color: #72dfb0;
 }
+.badge.gray {
+  background: #2a3039;
+  color: #aeb8c2;
+}
+.policy-actions {
+  display: flex;
+  gap: 3px;
+  margin-top: 5px;
+  flex-wrap: nowrap;
+}
+button.mini {
+  padding: 2px 4px;
+  font-size: 8px;
+  border-radius: 3px;
+  background: #1b242e;
+  color: #9ba9b4;
+  white-space: nowrap;
+}
+button.mini:hover:not(:disabled) {
+  background: #263b3b;
+}
+.exception-tag.managed {
+  background: #173a31;
+  color: #7adbb6;
+}
+#focus-error {
+  margin-top: 9px;
+}
 .callout {
   margin-top: 12px;
   background: #14282e;
